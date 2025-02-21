@@ -1,0 +1,14 @@
+{
+  "name": "weixin-server",
+  "version": "1.0.0",
+  "description": "WeChat Official Account Message Handler",
+  "main": "app.js",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "express": "^4.17.1",
+    "xml2js": "^0.4.23"
+  },
+  "scripts": {
+    "start": "sudo node app.js"
+  }
+}
