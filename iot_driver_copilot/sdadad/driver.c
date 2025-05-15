@@ -2,162 +2,198 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
 #include <ctype.h>
-#include <netinet/in.h>
+#include <errno.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
 
-// Maximum request size
-#define REQ_BUF_SZ 4096
-#define RESP_BUF_SZ 8192
+#define BUF_SIZE 8192
+#define SMALL_BUF 256
 
-// Helper to read env with default
-const char* getenvd(const char* key, const char* def) {
-    const char *val = getenv(key);
-    return val ? val : def;
+// Helper to read environment variable or fallback
+char* get_env(const char* name, const char* fallback) {
+    char* val = getenv(name);
+    if (!val || !*val) return (char*)fallback;
+    return val;
 }
 
-// JSON response for /info endpoint
-const char* device_info_json() {
-    return "{"
-        "\"device_name\":\"sdadad\","
-        "\"device_model\":\"sda\","
-        "\"manufacturer\":\"sadasd\","
-        "\"device_type\":\"dasdasd\","
-        "\"primary_protocol\":\"sdadasd\""
-        "}";
+// Mock function to simulate device data retrieval
+// In a real use case, this must connect to the device using sdadasd protocol and fetch data
+char* fetch_device_data() {
+    // Return dummy JSON. Replace with actual protocol logic.
+    return "{\"temperature\":22.5,\"humidity\":55}";
 }
 
-// Simulate current data points (could be fetched from device)
-void get_device_data(char* buf, size_t sz) {
-    // Example payload
-    snprintf(buf, sz,
-        "{"
-            "\"data_points\": {"
-                "\"dasdasdsd\": \"value\""
-            "}"
-        "}"
-    );
-}
-
-// Simulate sending a command to the device
-int process_device_command(const char* cmd_payload, char* resp, size_t sz) {
-    // In a real driver, parse and send the command to the device
-    // Here we echo back for demonstration
-    snprintf(resp, sz, "{\"status\":\"success\",\"received\":%s}", cmd_payload);
+// Mock function to simulate device command execution
+// In a real use case, this must send the command to the device using sdadasd protocol
+int send_device_command(const char* cmd_json, char* response, size_t max_len) {
+    snprintf(response, max_len, "{\"status\":\"ok\",\"command_received\":%s}", cmd_json);
     return 0;
 }
 
-// Minimal HTTP parser for path and method
-void parse_http_request(const char* req, char* method, char* path) {
-    sscanf(req, "%15s %255s", method, path);
-}
-
-// Helper: skip HTTP headers, return pointer to body
-const char* skip_http_headers(const char* req) {
-    const char* p = strstr(req, "\r\n\r\n");
-    return p ? p + 4 : "";
-}
-
-// HTTP response helpers
-void http_response(int client, const char* status, const char* content_type, const char* body) {
-    char header[512];
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
+// Server responds with device info
+void handle_info(int client) {
+    char resp[BUF_SIZE];
+    snprintf(resp, sizeof(resp),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
         "Connection: close\r\n"
-        "\r\n",
-        status, content_type, strlen(body));
-    send(client, header, strlen(header), 0);
-    send(client, body, strlen(body), 0);
+        "\r\n"
+        "{"
+            "\"device_name\":\"sdadad\","
+            "\"device_model\":\"sda\","
+            "\"manufacturer\":\"sadasd\","
+            "\"device_type\":\"dasdasd\","
+            "\"primary_protocol\":\"sdadasd\""
+        "}");
+    send(client, resp, strlen(resp), 0);
 }
 
-void http_response_404(int client) {
-    http_response(client, "404 Not Found", "application/json", "{\"error\":\"Not found\"}");
+// Server responds with device data
+void handle_data(int client) {
+    char* data = fetch_device_data();
+    char resp[BUF_SIZE];
+    snprintf(resp, sizeof(resp),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s", data);
+    send(client, resp, strlen(resp), 0);
 }
 
-void http_response_405(int client) {
-    http_response(client, "405 Method Not Allowed", "application/json", "{\"error\":\"Method not allowed\"}");
+// Server handles command POST
+void handle_cmd(int client, const char* req_body) {
+    char resp_json[BUF_SIZE];
+    send_device_command(req_body, resp_json, sizeof(resp_json));
+    char resp[BUF_SIZE];
+    snprintf(resp, sizeof(resp),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s", resp_json);
+    send(client, resp, strlen(resp), 0);
 }
 
-// HTTP server main loop
-void http_server_loop(int server_fd) {
-    char req_buf[REQ_BUF_SZ];
-    char resp_buf[RESP_BUF_SZ];
-
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client < 0) continue;
-
-        ssize_t rlen = recv(client, req_buf, REQ_BUF_SZ-1, 0);
-        if (rlen <= 0) { close(client); continue; }
-        req_buf[rlen] = 0;
-
-        char method[16] = {0}, path[256] = {0};
-        parse_http_request(req_buf, method, path);
-
-        if (strcmp(path, "/info") == 0 && strcmp(method, "GET") == 0) {
-            http_response(client, "200 OK", "application/json", device_info_json());
+// Read a line from socket, up to maxlen or \n, returns length read
+ssize_t read_line(int fd, char* buf, size_t maxlen) {
+    ssize_t n, rc;
+    char c;
+    for (n = 0; n < maxlen - 1; n++) {
+        rc = recv(fd, &c, 1, 0);
+        if (rc == 1) {
+            buf[n] = c;
+            if (c == '\n') {
+                n++;
+                break;
+            }
+        } else if (rc == 0) {
+            break;
+        } else {
+            if (errno == EINTR) continue;
+            return -1;
         }
-        else if (strcmp(path, "/data") == 0 && strcmp(method, "GET") == 0) {
-            get_device_data(resp_buf, sizeof(resp_buf));
-            http_response(client, "200 OK", "application/json", resp_buf);
-        }
-        else if (strcmp(path, "/cmd") == 0 && strcmp(method, "POST") == 0) {
-            const char* body = skip_http_headers(req_buf);
-            process_device_command(body, resp_buf, sizeof(resp_buf));
-            http_response(client, "200 OK", "application/json", resp_buf);
-        }
-        else if (
-            (strcmp(path, "/info") == 0 || strcmp(path, "/data") == 0) && strcmp(method, "POST") == 0
-            ||
-            (strcmp(path, "/cmd") == 0 && strcmp(method, "GET") == 0)
-        ) {
-            http_response_405(client);
-        }
-        else {
-            http_response_404(client);
-        }
-
-        close(client);
     }
+    buf[n] = 0;
+    return n;
+}
+
+// Parse HTTP request, return method, path, and if POST, the body
+void parse_http_request(int client, char* method, char* path, char* body, size_t body_size) {
+    char line[SMALL_BUF];
+    int content_length = 0;
+    int is_post = 0;
+
+    // Read request line
+    read_line(client, line, sizeof(line));
+    sscanf(line, "%s %s", method, path);
+
+    // Read headers
+    while (1) {
+        ssize_t n = read_line(client, line, sizeof(line));
+        if (n <= 2) break; // \r\n alone means end of headers
+        if (strncasecmp(line, "Content-Length:", 15) == 0) {
+            content_length = atoi(line + 15);
+        }
+        if (strcasecmp(method, "POST") == 0) is_post = 1;
+    }
+    // Read body if POST
+    if (is_post && content_length > 0 && body_size > 0) {
+        int total = 0, n;
+        while (total < content_length && total < (int)body_size - 1) {
+            n = recv(client, body + total, content_length - total, 0);
+            if (n <= 0) break;
+            total += n;
+        }
+        body[total] = 0;
+    } else if (body_size > 0) {
+        body[0] = 0;
+    }
+}
+
+// Main HTTP handler
+void handle_client(int client) {
+    char method[SMALL_BUF], path[SMALL_BUF], body[BUF_SIZE];
+
+    parse_http_request(client, method, path, body, sizeof(body));
+
+    if (strcasecmp(method, "GET") == 0 && strcmp(path, "/info") == 0) {
+        handle_info(client);
+    } else if (strcasecmp(method, "GET") == 0 && strcmp(path, "/data") == 0) {
+        handle_data(client);
+    } else if (strcasecmp(method, "POST") == 0 && strcmp(path, "/cmd") == 0) {
+        handle_cmd(client, body);
+    } else {
+        const char* resp =
+            "HTTP/1.1 404 Not Found\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "404 Not Found\n";
+        send(client, resp, strlen(resp), 0);
+    }
+    close(client);
 }
 
 int main() {
-    // Config from env
-    const char *server_host = getenvd("SERVER_HOST", "0.0.0.0");
-    const char *server_port_str = getenvd("SERVER_PORT", "8080");
-    int server_port = atoi(server_port_str);
+    const char* host = get_env("DRIVER_SERVER_HOST", "0.0.0.0");
+    int port = atoi(get_env("DRIVER_SERVER_PORT", "8080"));
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); exit(1); }
+    int server_fd, client_fd;
+    struct sockaddr_in addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket");
+        exit(1);
+    }
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(server_host);
-    addr.sin_port = htons(server_port);
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(host);
 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(server_fd); exit(1);
+        perror("bind");
+        exit(1);
+    }
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        exit(1);
     }
 
-    if (listen(server_fd, 8) < 0) {
-        perror("listen"); close(server_fd); exit(1);
+    printf("HTTP server listening on %s:%d\n", host, port);
+
+    while (1) {
+        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) continue;
+        handle_client(client_fd);
     }
-
-    printf("HTTP server listening on %s:%d\n", server_host, server_port);
-
-    http_server_loop(server_fd);
-
     close(server_fd);
     return 0;
 }
