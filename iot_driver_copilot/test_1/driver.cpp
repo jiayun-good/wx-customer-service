@@ -1,271 +1,238 @@
 #include <iostream>
-#include <cstdlib>
 #include <sstream>
 #include <string>
+#include <cstdlib>
 #include <map>
 #include <vector>
+#include <algorithm>
 #include <cstring>
 #include <thread>
-#include <algorithm>
-#include <ctime>
-
-// Simple HTTP server using sockets (no third-party code or external commands)
-#ifdef _WIN32
-#include <winsock2.h>
-#pragma comment(lib, "ws2_32.lib")
-typedef int socklen_t;
-#else
-#include <sys/socket.h>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <netinet/in.h>
 #include <unistd.h>
-#endif
+#include <sys/socket.h>
 
-#define BUFFER_SIZE 4096
-
-// Helper to trim whitespace
-static inline std::string trim(const std::string& s) {
-    auto start = s.begin();
-    while (start != s.end() && isspace(*start)) ++start;
-    auto end = s.end();
-    do { --end; } while (distance(start, end) > 0 && isspace(*end));
-    return std::string(start, end + 1);
+// Utility for environment variable with default
+std::string get_env(const std::string& var, const std::string& def) {
+    const char* val = std::getenv(var.c_str());
+    return val ? std::string(val) : def;
 }
 
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::string http_version;
-    std::map<std::string, std::string> headers;
-    std::string body;
-    std::map<std::string, std::string> query_params;
-};
-
-std::string url_decode(const std::string& str) {
-    std::string ret;
-    char ch;
-    int i, ii, len = str.length();
-    for (i = 0; i < len; i++) {
-        if (str[i] != '%') {
-            if (str[i] == '+')
-                ret += ' ';
-            else
-                ret += str[i];
-        } else {
-            sscanf(str.substr(i + 1, 2).c_str(), "%x", &ii);
-            ch = static_cast<char>(ii);
-            ret += ch;
-            i = i + 2;
-        }
-    }
-    return ret;
-}
-
-std::map<std::string, std::string> parse_query(const std::string& qs) {
-    std::map<std::string, std::string> params;
-    std::string::size_type lastPos = 0, pos = 0;
-    while ((pos = qs.find('&', lastPos)) != std::string::npos) {
-        std::string token = qs.substr(lastPos, pos - lastPos);
-        std::string::size_type eq = token.find('=');
-        if (eq != std::string::npos)
-            params[url_decode(token.substr(0, eq))] = url_decode(token.substr(eq + 1));
-        lastPos = pos + 1;
-    }
-    if (lastPos < qs.length()) {
-        std::string token = qs.substr(lastPos);
-        std::string::size_type eq = token.find('=');
-        if (eq != std::string::npos)
-            params[url_decode(token.substr(0, eq))] = url_decode(token.substr(eq + 1));
-    }
-    return params;
-}
-
-HttpRequest parse_request(const std::string& raw) {
-    HttpRequest req;
-    std::istringstream stream(raw);
-    std::string line;
-    std::getline(stream, line);
-    std::istringstream lstream(line);
-    lstream >> req.method >> req.path >> req.http_version;
-    // Parse query string if present
-    auto qmark = req.path.find('?');
-    if (qmark != std::string::npos) {
-        req.query_params = parse_query(req.path.substr(qmark + 1));
-        req.path = req.path.substr(0, qmark);
-    }
-    // Headers
-    while (std::getline(stream, line) && line != "\r") {
-        auto colon = line.find(':');
-        if (colon != std::string::npos) {
-            std::string key = trim(line.substr(0, colon));
-            std::string value = trim(line.substr(colon + 1));
-            // Remove trailing \r
-            if (!value.empty() && value.back() == '\r') value.pop_back();
-            req.headers[key] = value;
-        }
-    }
-    // Body
-    std::string body;
-    while (std::getline(stream, line)) {
-        body += line + "\n";
-    }
-    req.body = body;
-    return req;
-}
-
-// Simulate device data in XML format
-std::string get_device_data_xml(const std::map<std::string, std::string>& query) {
-    // Simulate filter, limit, offset
-    std::string filter = "";
-    int limit = 1, offset = 0;
-    if (query.count("filter")) filter = query.at("filter");
-    if (query.count("limit")) limit = std::max(1, std::stoi(query.at("limit")));
-    if (query.count("offset")) offset = std::max(0, std::stoi(query.at("offset")));
-
+// XML Data Simulation (Replace with your actual device query logic)
+std::string get_device_xml_data(const std::string& filter, int limit, int offset) {
     std::ostringstream oss;
-    oss << "<?xml version=\"1.0\"?>\n";
-    oss << "<DeviceDataPoints>\n";
+    oss << "<dataPoints>";
     for (int i = 0; i < limit; ++i) {
-        oss << "  <DataPoint>\n";
-        oss << "    <Name>dp" << (offset + i) << "</Name>\n";
-        oss << "    <Value>" << ((filter.empty()) ? "42" : filter) << "</Value>\n";
-        oss << "    <Timestamp>" << std::time(nullptr) << "</Timestamp>\n";
-        oss << "  </DataPoint>\n";
+        int idx = offset + i;
+        oss << "<dataPoint>";
+        oss << "<id>" << idx << "</id>";
+        oss << "<name>DataPoint" << idx << "</name>";
+        oss << "<value>" << (idx * 10) << "</value>";
+        oss << "</dataPoint>";
     }
-    oss << "</DeviceDataPoints>\n";
+    oss << "</dataPoints>";
     return oss.str();
 }
 
-// Simulate command processing and respond in JSON
-std::string process_command(const std::string& body, bool &valid) {
-    std::string action;
-    // Simple parse for JSON: look for "action":"..."
-    auto pos = body.find("\"action\"");
-    if (pos != std::string::npos) {
-        auto start = body.find(':', pos);
-        if (start != std::string::npos) {
-            start++;
-            while (start < body.size() && (body[start] == ' ' || body[start] == '"')) ++start;
-            auto end = body.find_first_of("\"},", start);
-            if (end != std::string::npos)
-                action = body.substr(start, end - start);
-        }
+// Parse query parameters from URL
+std::map<std::string, std::string> parse_query(const std::string& query) {
+    std::map<std::string, std::string> params;
+    std::string::size_type last = 0, next = 0;
+    while ((next = query.find('&', last)) != std::string::npos) {
+        std::string pair = query.substr(last, next - last);
+        auto eq = pair.find('=');
+        if (eq != std::string::npos)
+            params[pair.substr(0, eq)] = pair.substr(eq + 1);
+        last = next + 1;
     }
-    valid = !action.empty();
+    std::string pair = query.substr(last);
+    auto eq = pair.find('=');
+    if (eq != std::string::npos)
+        params[pair.substr(0, eq)] = pair.substr(eq + 1);
+    return params;
+}
+
+// Minimal JSON builder (for command response)
+std::string build_json_response(const std::string& status, const std::string& msg) {
     std::ostringstream oss;
-    oss << "{\n";
-    oss << "  \"accepted\": " << (valid ? "true" : "false") << ",\n";
-    oss << "  \"executed\": " << (valid ? "true" : "false") << ",\n";
-    oss << "  \"action\": \"" << (valid ? action : "") << "\"\n";
+    oss << "{";
+    oss << "\"status\":\"" << status << "\",";
+    oss << "\"message\":\"" << msg << "\"";
     oss << "}";
     return oss.str();
 }
 
-// Send HTTP response
-void send_response(int client_sock, const std::string& status, const std::string& content_type, const std::string& body) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 " << status << "\r\n";
-    oss << "Content-Type: " << content_type << "\r\n";
-    oss << "Content-Length: " << body.size() << "\r\n";
-    oss << "Connection: close\r\n";
-    oss << "\r\n";
-    oss << body;
-    std::string resp = oss.str();
-    send(client_sock, resp.c_str(), resp.size(), 0);
+// Parse HTTP request line and headers
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string query;
+    std::string httpver;
+    std::map<std::string, std::string> headers;
+    std::string body;
+};
+
+bool parse_http_request(const std::string& raw, HttpRequest& req) {
+    std::istringstream iss(raw);
+    std::string line;
+    if (!std::getline(iss, line)) return false;
+    std::istringstream first(line);
+    if (!(first >> req.method >> req.path >> req.httpver)) return false;
+
+    // Split path and query
+    auto qpos = req.path.find('?');
+    if (qpos != std::string::npos) {
+        req.query = req.path.substr(qpos + 1);
+        req.path = req.path.substr(0, qpos);
+    }
+
+    // Headers
+    while (std::getline(iss, line) && line != "\r") {
+        if (line.back() == '\r') line.pop_back();
+        auto colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = line.substr(0, colon);
+            while (!key.empty() && key.back() == ' ') key.pop_back();
+            std::string value = line.substr(colon + 1);
+            while (!value.empty() && value.front() == ' ') value.erase(0, 1);
+            req.headers[key] = value;
+        }
+    }
+
+    // Body (if any)
+    std::ostringstream bodyoss;
+    while (std::getline(iss, line)) bodyoss << line << "\n";
+    req.body = bodyoss.str();
+    if (!req.body.empty() && req.body.back() == '\n') req.body.pop_back();
+    return true;
 }
 
-// Threaded handler for a client connection
-void handle_client(int client_sock) {
-    char buffer[BUFFER_SIZE];
-    int received = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
-    if (received <= 0) {
-#ifdef _WIN32
-        closesocket(client_sock);
-#else
-        close(client_sock);
-#endif
+// HTTP Response helpers
+void send_404(int client) {
+    std::string resp = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nNot Found";
+    send(client, resp.c_str(), resp.size(), 0);
+}
+
+void send_405(int client) {
+    std::string resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
+    send(client, resp.c_str(), resp.size(), 0);
+}
+
+void send_400(int client, const std::string& msg) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: " << msg.size() << "\r\n\r\n" << msg;
+    std::string resp = oss.str();
+    send(client, resp.c_str(), resp.size(), 0);
+}
+
+void send_xml(int client, const std::string& xml) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " << xml.size() << "\r\n\r\n" << xml;
+    std::string resp = oss.str();
+    send(client, resp.c_str(), resp.size(), 0);
+}
+
+void send_json(int client, const std::string& json) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " << json.size() << "\r\n\r\n" << json;
+    std::string resp = oss.str();
+    send(client, resp.c_str(), resp.size(), 0);
+}
+
+// Handle /data endpoint (GET)
+void handle_get_data(int client, const HttpRequest& req) {
+    auto params = parse_query(req.query);
+
+    std::string filter = params.count("filter") ? params["filter"] : "";
+    int limit = params.count("limit") ? std::stoi(params["limit"]) : 10;
+    int offset = params.count("offset") ? std::stoi(params["offset"]) : 0;
+
+    std::string xml = get_device_xml_data(filter, limit, offset);
+    send_xml(client, xml);
+}
+
+// Handle /commands endpoint (POST)
+void handle_post_command(int client, const HttpRequest& req) {
+    // Here, you would parse the XML/JSON payload and execute the command.
+    // For demonstration, we simulate command acceptance.
+    std::string resp = build_json_response("accepted", "Command received and executed.");
+    send_json(client, resp);
+}
+
+// Main HTTP request handler
+void handle_client(int client) {
+    constexpr size_t BUF_SIZE = 8192;
+    char buf[BUF_SIZE];
+    ssize_t bytes = recv(client, buf, BUF_SIZE - 1, 0);
+    if (bytes <= 0) {
+        close(client);
         return;
     }
-    buffer[received] = 0;
-    std::string request_str(buffer);
-    HttpRequest req = parse_request(request_str);
-    if (req.method == "GET" && req.path == "/data") {
-        std::string xml = get_device_data_xml(req.query_params);
-        send_response(client_sock, "200 OK", "application/xml", xml);
-    } else if (req.method == "POST" && req.path == "/commands") {
-        bool valid = false;
-        std::string json = process_command(req.body, valid);
-        if (valid)
-            send_response(client_sock, "200 OK", "application/json", json);
-        else
-            send_response(client_sock, "400 Bad Request", "application/json", "{\"error\":\"Invalid command\"}");
-    } else {
-        send_response(client_sock, "404 Not Found", "text/plain", "Not Found");
+    buf[bytes] = '\0';
+
+    HttpRequest req;
+    if (!parse_http_request(buf, req)) {
+        send_400(client, "Bad HTTP request");
+        close(client);
+        return;
     }
-#ifdef _WIN32
-    closesocket(client_sock);
-#else
-    close(client_sock);
-#endif
+
+    if (req.method == "GET" && req.path == "/data") {
+        handle_get_data(client, req);
+    } else if (req.method == "POST" && req.path == "/commands") {
+        handle_post_command(client, req);
+    } else if ( (req.method == "GET" && req.path == "/") || (req.method == "GET" && req.path == "/healthz")) {
+        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
+        send(client, resp.c_str(), resp.size(), 0);
+    } else if (req.method != "GET" && req.method != "POST") {
+        send_405(client);
+    } else {
+        send_404(client);
+    }
+    close(client);
 }
 
 int main() {
-    // Read configuration from environment variables
-    const char* env_host = std::getenv("SHIFU_HTTP_SERVER_HOST");
-    const char* env_port = std::getenv("SHIFU_HTTP_SERVER_PORT");
-    std::string host = env_host ? env_host : "0.0.0.0";
-    int port = env_port ? std::atoi(env_port) : 8080;
+    std::string server_host = get_env("SHIFU_HTTP_SERVER_HOST", "0.0.0.0");
+    int server_port = std::stoi(get_env("SHIFU_HTTP_SERVER_PORT", "8080"));
 
-#ifdef _WIN32
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
-
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        std::cerr << "Socket creation failed\n";
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        std::cerr << "Cannot create socket\n";
         return 1;
     }
+
     int opt = 1;
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in addr;
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = host == "0.0.0.0" ? INADDR_ANY : inet_addr(host.c_str());
+    addr.sin_addr.s_addr = (server_host == "0.0.0.0") ? INADDR_ANY : inet_addr(server_host.c_str());
+    addr.sin_port = htons(server_port);
 
-    if (bind(server_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
         std::cerr << "Bind failed\n";
-#ifdef _WIN32
-        closesocket(server_sock);
-        WSACleanup();
-#else
-        close(server_sock);
-#endif
+        close(server_fd);
         return 1;
     }
-    if (listen(server_sock, 8) < 0) {
+    if (listen(server_fd, 20) < 0) {
         std::cerr << "Listen failed\n";
-#ifdef _WIN32
-        closesocket(server_sock);
-        WSACleanup();
-#else
-        close(server_sock);
-#endif
+        close(server_fd);
         return 1;
     }
-    std::cout << "Server listening on " << host << ":" << port << std::endl;
+
+    std::cout << "HTTP server started at " << server_host << ":" << server_port << std::endl;
+
     while (true) {
-        sockaddr_in client_addr;
+        sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
-        int client_sock = accept(server_sock, (sockaddr*)&client_addr, &client_len);
-        if (client_sock < 0) continue;
-        std::thread(handle_client, client_sock).detach();
+        int client = accept(server_fd, (sockaddr*)&client_addr, &client_len);
+        if (client < 0) continue;
+        std::thread([client](){ handle_client(client); }).detach();
     }
-#ifdef _WIN32
-    closesocket(server_sock);
-    WSACleanup();
-#else
-    close(server_sock);
-#endif
+
+    close(server_fd);
     return 0;
 }
