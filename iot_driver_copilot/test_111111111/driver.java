@@ -1,88 +1,80 @@
 import com.sun.net.httpserver.HttpServer;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpExchange;
 
-import java.io.*;
+import java.io.OutputStream;
+import java.io.InputStream;
+import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.net.InetSocketAddress;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.stream.Collectors;
+import java.nio.charset.StandardCharsets;
 
 public class DeviceShifuDriver {
+    // Environment variable keys
+    private static final String ENV_SERVER_HOST = "SERVER_HOST";
+    private static final String ENV_SERVER_PORT = "SERVER_PORT";
+    private static final String ENV_DEVICE_IP = "DEVICE_IP";
+    private static final String ENV_DEVICE_PORT = "DEVICE_PORT";
 
-    // Simulated device data points (in-memory for demonstration)
-    private static final List<Map<String, Object>> DATA_POINTS = Collections.synchronizedList(new ArrayList<>());
-    private static final int DEFAULT_PAGE_SIZE = 10;
-
-    // Device configuration loaded from environment
-    private static final String DEVICE_IP = System.getenv("DEVICE_IP");
-    private static final String DEVICE_PORT = System.getenv("DEVICE_PORT");
-    private static final String SERVER_HOST = System.getenv("SERVER_HOST") != null ? System.getenv("SERVER_HOST") : "0.0.0.0";
-    private static final int SERVER_PORT = System.getenv("SERVER_PORT") != null ? Integer.parseInt(System.getenv("SERVER_PORT")) : 8080;
+    // Example stub data for demonstration (replace with real device interaction)
+    private static final List<Map<String, Object>> DEVICE_POINTS = Collections.synchronizedList(new ArrayList<>());
 
     public static void main(String[] args) throws Exception {
-        initSampleData();
+        String host = System.getenv(ENV_SERVER_HOST);
+        String portStr = System.getenv(ENV_SERVER_PORT);
+        String deviceIp = System.getenv(ENV_DEVICE_IP);
+        String devicePort = System.getenv(ENV_DEVICE_PORT);
 
-        HttpServer server = HttpServer.create(new InetSocketAddress(SERVER_HOST, SERVER_PORT), 0);
+        if (host == null || host.isEmpty()) host = "0.0.0.0";
+        int port = 8080;
+        if (portStr != null && !portStr.isEmpty()) {
+            try {
+                port = Integer.parseInt(portStr);
+            } catch (NumberFormatException e) {
+                System.err.println("Invalid SERVER_PORT env, default to 8080");
+            }
+        }
+
+        HttpServer server = HttpServer.create(new InetSocketAddress(host, port), 0);
         server.createContext("/points", new PointsHandler());
         server.createContext("/commands", new CommandsHandler());
-
-        server.setExecutor(Executors.newCachedThreadPool());
-        System.out.println("DeviceShifuDriver HTTP Server started on " + SERVER_HOST + ":" + SERVER_PORT);
+        server.setExecutor(null); // default executor
+        System.out.println("DeviceShifuDriver running on " + host + ":" + port);
         server.start();
-    }
-
-    // Populate with sample telemetry data
-    private static void initSampleData() {
-        for (int i = 1; i <= 50; i++) {
-            Map<String, Object> point = new HashMap<>();
-            point.put("id", i);
-            point.put("timestamp", System.currentTimeMillis() - i * 10000L);
-            point.put("temperature", 20.0 + Math.random() * 5);
-            point.put("humidity", 30.0 + Math.random() * 10);
-            DATA_POINTS.add(point);
-        }
     }
 
     // Handler for GET /points
     static class PointsHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if (!exchange.getRequestMethod().equalsIgnoreCase("GET")) {
-                sendJsonResponse(exchange, 405, "{\"error\":\"Method Not Allowed\"}");
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
                 return;
             }
-            Map<String, String> params = queryToMap(exchange.getRequestURI().getRawQuery());
-
-            int page = 1;
-            int limit = DEFAULT_PAGE_SIZE;
+            // Query parameters: page, limit
+            Map<String, String> params = queryToMap(exchange.getRequestURI().getQuery());
+            int page = 1, limit = 10;
             try {
-                if (params.containsKey("page")) {
-                    page = Integer.parseInt(params.get("page"));
-                    if (page < 1) page = 1;
-                }
-                if (params.containsKey("limit")) {
-                    limit = Integer.parseInt(params.get("limit"));
-                    if (limit < 1) limit = DEFAULT_PAGE_SIZE;
-                }
+                if (params.containsKey("page")) page = Integer.parseInt(params.get("page"));
+                if (params.containsKey("limit")) limit = Integer.parseInt(params.get("limit"));
             } catch (NumberFormatException ignored) {}
 
-            int fromIndex = (page - 1) * limit;
-            int toIndex = Math.min(fromIndex + limit, DATA_POINTS.size());
-            List<Map<String, Object>> pageData = new ArrayList<>();
-            if (fromIndex < DATA_POINTS.size())
-                pageData = DATA_POINTS.subList(fromIndex, toIndex);
+            // Simulate device data acquisition: this should fetch real device telemetry
+            List<Map<String, Object>> allPoints = getDevicePoints();
 
-            Map<String, Object> result = new HashMap<>();
+            int from = (page - 1) * limit;
+            int to = Math.min(from + limit, allPoints.size());
+            List<Map<String, Object>> pagedPoints = from >= allPoints.size() ? Collections.emptyList() : allPoints.subList(from, to);
+
+            Map<String, Object> result = new LinkedHashMap<>();
             result.put("page", page);
             result.put("limit", limit);
-            result.put("total", DATA_POINTS.size());
-            result.put("data", pageData);
+            result.put("total", allPoints.size());
+            result.put("data", pagedPoints);
 
-            sendJsonResponse(exchange, 200, toJson(result));
+            String respJson = toJson(result);
+            sendResponse(exchange, 200, respJson, "application/json");
         }
     }
 
@@ -90,66 +82,79 @@ public class DeviceShifuDriver {
     static class CommandsHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
-                sendJsonResponse(exchange, 405, "{\"error\":\"Method Not Allowed\"}");
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
                 return;
             }
-            String contentType = Optional.ofNullable(exchange.getRequestHeaders().getFirst("Content-Type")).orElse("");
-            if (!contentType.toLowerCase().contains("application/json")) {
-                sendJsonResponse(exchange, 415, "{\"error\":\"Content-Type must be application/json\"}");
-                return;
-            }
-
-            String body = new BufferedReader(new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8))
-                    .lines().collect(Collectors.joining("\n"));
-            // In a real driver, parse the command & interact with device.
-            // Here, just echo the command and respond with status.
-            Map<String, Object> response = new HashMap<>();
-            response.put("received_command", body);
-            response.put("status", "success");
-            sendJsonResponse(exchange, 200, toJson(response));
+            String body = readRequestBody(exchange.getRequestBody());
+            // In real implementation, parse and execute command on device
+            // Here, we just echo the received command and simulate a success response
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("status", "success");
+            resp.put("received", body);
+            String respJson = toJson(resp);
+            sendResponse(exchange, 200, respJson, "application/json");
         }
     }
 
-    // --- Utility methods ---
+    // Simulated device point acquisition
+    private static List<Map<String, Object>> getDevicePoints() {
+        // For demonstration, generate some fake points if empty
+        if (DEVICE_POINTS.isEmpty()) {
+            for (int i = 1; i <= 25; ++i) {
+                Map<String, Object> point = new LinkedHashMap<>();
+                point.put("id", i);
+                point.put("timestamp", System.currentTimeMillis());
+                point.put("value", Math.random() * 100);
+                DEVICE_POINTS.add(point);
+            }
+        }
+        return DEVICE_POINTS;
+    }
 
+    // Util: Parse query string into map
     private static Map<String, String> queryToMap(String query) {
-        Map<String, String> result = new HashMap<>();
-        if (query == null || query.trim().isEmpty()) return result;
-        for (String param : query.split("&")) {
-            String[] entry = param.split("=", 2);
-            if (entry.length > 0) {
-                String key = urlDecode(entry[0]);
-                String value = entry.length > 1 ? urlDecode(entry[1]) : "";
-                result.put(key, value);
+        Map<String, String> map = new HashMap<>();
+        if (query == null) return map;
+        String[] params = query.split("&");
+        for (String param : params) {
+            String[] pair = param.split("=");
+            if (pair.length == 2) {
+                map.put(pair[0], pair[1]);
             }
         }
-        return result;
+        return map;
     }
 
-    private static String urlDecode(String s) {
-        try {
-            return java.net.URLDecoder.decode(s, StandardCharsets.UTF_8.name());
-        } catch (Exception e) {
-            return s;
+    // Util: Read request body as string
+    private static String readRequestBody(InputStream is) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[1024];
+        int read;
+        while ((read = is.read(buf)) != -1) {
+            bos.write(buf, 0, read);
         }
+        return new String(bos.toByteArray(), StandardCharsets.UTF_8);
     }
 
-    private static void sendJsonResponse(HttpExchange exchange, int status, String json) throws IOException {
-        Headers headers = exchange.getResponseHeaders();
-        headers.set("Content-Type", "application/json; charset=utf-8");
-        exchange.sendResponseHeaders(status, json.getBytes(StandardCharsets.UTF_8).length);
+    // Util: Send HTTP response
+    private static void sendResponse(HttpExchange exchange, int statusCode, String body, String contentType) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", contentType + "; charset=UTF-8");
+        byte[] resp = body.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(statusCode, resp.length);
         try (OutputStream os = exchange.getResponseBody()) {
-            os.write(json.getBytes(StandardCharsets.UTF_8));
+            os.write(resp);
         }
     }
 
-    // Simple JSON serializer for maps and lists
+    // Minimal JSON serialization (for demonstration)
     private static String toJson(Object obj) {
         if (obj instanceof Map) {
-            StringBuilder sb = new StringBuilder("{");
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            Map<?, ?> map = (Map<?, ?>) obj;
             boolean first = true;
-            for (Map.Entry<?, ?> entry : ((Map<?, ?>) obj).entrySet()) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
                 if (!first) sb.append(",");
                 sb.append("\"").append(escapeJson(entry.getKey().toString())).append("\":");
                 sb.append(toJson(entry.getValue()));
@@ -158,25 +163,27 @@ public class DeviceShifuDriver {
             sb.append("}");
             return sb.toString();
         } else if (obj instanceof List) {
-            StringBuilder sb = new StringBuilder("[");
+            StringBuilder sb = new StringBuilder();
+            sb.append("[");
             boolean first = true;
-            for (Object o : (List<?>) obj) {
+            for (Object item : (List<?>) obj) {
                 if (!first) sb.append(",");
-                sb.append(toJson(o));
+                sb.append(toJson(item));
                 first = false;
             }
             sb.append("]");
             return sb.toString();
         } else if (obj instanceof String) {
             return "\"" + escapeJson((String) obj) + "\"";
+        } else if (obj instanceof Number || obj instanceof Boolean) {
+            return obj.toString();
         } else if (obj == null) {
             return "null";
-        } else {
-            return obj.toString();
         }
+        return "\"" + escapeJson(String.valueOf(obj)) + "\"";
     }
 
     private static String escapeJson(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 }
