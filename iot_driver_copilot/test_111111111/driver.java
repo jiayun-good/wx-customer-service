@@ -1,148 +1,182 @@
-import com.sun.net.httpserver.Headers;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
-import org.json.JSONArray;
-import org.json.JSONObject;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.Headers;
 
-import java.io.*;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.InputStreamReader;
+import java.io.BufferedReader;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class DeviceShifuDriver {
 
-    private static final String ENV_SERVER_HOST = "SERVER_HOST";
-    private static final String ENV_SERVER_PORT = "SERVER_PORT";
-    private static final String ENV_DEVICE_IP = "DEVICE_IP";
-    private static final String ENV_DEVICE_PORT = "DEVICE_PORT";
-
-    // Simulated device data for demonstration
-    private static final List<Map<String, Object>> DEVICE_POINTS = new ArrayList<>();
+    // Simulated device data (replace with real device access logic)
+    private static final List<Map<String, Object>> DATA_POINTS = Collections.synchronizedList(new ArrayList<>());
     static {
-        for (int i = 1; i <= 100; i++) {
-            Map<String, Object> point = new HashMap<>();
-            point.put("id", i);
-            point.put("name", "DataPoint-" + i);
-            point.put("value", Math.random() * 100);
-            point.put("timestamp", System.currentTimeMillis());
-            DEVICE_POINTS.add(point);
+        Map<String, Object> point1 = new HashMap<>();
+        point1.put("timestamp", System.currentTimeMillis());
+        point1.put("temperature", 25.3);
+        point1.put("status", "OK");
+        DATA_POINTS.add(point1);
+
+        Map<String, Object> point2 = new HashMap<>();
+        point2.put("timestamp", System.currentTimeMillis() - 10000);
+        point2.put("temperature", 24.9);
+        point2.put("status", "OK");
+        DATA_POINTS.add(point2);
+    }
+
+    private static String readRequestBody(HttpExchange exchange) throws IOException {
+        InputStream is = exchange.getRequestBody();
+        BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) {
+            sb.append(line);
         }
+        return sb.toString();
+    }
+
+    private static Map<String, String> parseQuery(String query) throws IOException {
+        Map<String, String> result = new HashMap<>();
+        if (query == null || query.isEmpty()) return result;
+        String[] pairs = query.split("&");
+        for (String pair : pairs) {
+            int idx = pair.indexOf('=');
+            if (idx >= 0) {
+                result.put(URLDecoder.decode(pair.substring(0, idx), "UTF-8"),
+                           URLDecoder.decode(pair.substring(idx + 1), "UTF-8"));
+            } else {
+                result.put(URLDecoder.decode(pair, "UTF-8"), "");
+            }
+        }
+        return result;
+    }
+
+    private static void sendJsonResponse(HttpExchange exchange, String response, int statusCode) throws IOException {
+        Headers headers = exchange.getResponseHeaders();
+        headers.set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(statusCode, response.getBytes(StandardCharsets.UTF_8).length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(response.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static void handlePoints(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(405, -1); // Method Not Allowed
+            return;
+        }
+        String query = exchange.getRequestURI().getQuery();
+        Map<String, String> params = parseQuery(query);
+
+        int page = 1;
+        int limit = 10;
+        if (params.containsKey("page")) {
+            try { page = Integer.parseInt(params.get("page")); } catch (Exception ignored) {}
+            if (page < 1) page = 1;
+        }
+        if (params.containsKey("limit")) {
+            try { limit = Integer.parseInt(params.get("limit")); } catch (Exception ignored) {}
+            if (limit < 1) limit = 10;
+        }
+
+        int fromIndex = (page - 1) * limit;
+        int toIndex = Math.min(fromIndex + limit, DATA_POINTS.size());
+
+        List<Map<String, Object>> pageData = new ArrayList<>();
+        if (fromIndex < DATA_POINTS.size()) {
+            pageData.addAll(DATA_POINTS.subList(fromIndex, toIndex));
+        }
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("data", pageData);
+        result.put("page", page);
+        result.put("limit", limit);
+        result.put("total", DATA_POINTS.size());
+
+        String json = toJson(result);
+        sendJsonResponse(exchange, json, 200);
+    }
+
+    private static void handleCommands(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(405, -1); // Method Not Allowed
+            return;
+        }
+        String body = readRequestBody(exchange);
+        Map<String, Object> cmdResult = new HashMap<>();
+        cmdResult.put("success", true);
+        cmdResult.put("received", body);
+        cmdResult.put("timestamp", System.currentTimeMillis());
+        String json = toJson(cmdResult);
+        sendJsonResponse(exchange, json, 200);
+    }
+
+    // Minimal JSON serializer for this simple data
+    private static String toJson(Object obj) {
+        if (obj == null) return "null";
+        if (obj instanceof String) return "\"" + escape((String) obj) + "\"";
+        if (obj instanceof Number || obj instanceof Boolean) return obj.toString();
+        if (obj instanceof Map) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            boolean first = true;
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) obj).entrySet()) {
+                if (!first) sb.append(",");
+                sb.append(toJson(entry.getKey())).append(":").append(toJson(entry.getValue()));
+                first = false;
+            }
+            sb.append("}");
+            return sb.toString();
+        }
+        if (obj instanceof List) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("[");
+            boolean first = true;
+            for (Object o : (List<?>) obj) {
+                if (!first) sb.append(",");
+                sb.append(toJson(o));
+                first = false;
+            }
+            sb.append("]");
+            return sb.toString();
+        }
+        return "\"" + escape(obj.toString()) + "\"";
+    }
+
+    private static String escape(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     public static void main(String[] args) throws Exception {
-        String host = getEnvOrDefault(ENV_SERVER_HOST, "0.0.0.0");
-        int port = Integer.parseInt(getEnvOrDefault(ENV_SERVER_PORT, "8080"));
+        String serverHost = System.getenv("SERVER_HOST");
+        String serverPortStr = System.getenv("SERVER_PORT");
 
-        HttpServer server = HttpServer.create(new InetSocketAddress(host, port), 0);
-
-        server.createContext("/points", new PointsHandler());
-        server.createContext("/commands", new CommandsHandler());
-
-        server.setExecutor(null);
-        System.out.println("DeviceShifuDriver HTTP Server started at http://" + host + ":" + port);
-        server.start();
-    }
-
-    static class PointsHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
-                return;
-            }
-
-            Map<String, String> queryParams = parseQueryParams(exchange.getRequestURI().getRawQuery());
-            int page = parsePositiveInt(queryParams.get("page"), 1);
-            int limit = parsePositiveInt(queryParams.get("limit"), 10);
-
-            // Filter and paginate
-            int start = (page - 1) * limit;
-            int end = Math.min(start + limit, DEVICE_POINTS.size());
-            List<Map<String, Object>> dataPage = start < DEVICE_POINTS.size() ? DEVICE_POINTS.subList(start, end) : Collections.emptyList();
-
-            JSONObject response = new JSONObject();
-            response.put("page", page);
-            response.put("limit", limit);
-            response.put("total", DEVICE_POINTS.size());
-            response.put("data", new JSONArray(dataPage));
-
-            sendResponse(exchange, 200, response.toString(), "application/json");
-        }
-    }
-
-    static class CommandsHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
-                return;
-            }
-
-            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-            JSONObject json;
+        if (serverHost == null || serverHost.isEmpty()) serverHost = "0.0.0.0";
+        int serverPort = 8080;
+        if (serverPortStr != null && !serverPortStr.isEmpty()) {
             try {
-                json = new JSONObject(body);
-            } catch (Exception e) {
-                sendResponse(exchange, 400, "{\"error\":\"Invalid JSON payload\"}", "application/json");
-                return;
-            }
-
-            // Simulate command execution
-            JSONObject result = new JSONObject();
-            result.put("status", "success");
-            result.put("received", json);
-
-            sendResponse(exchange, 200, result.toString(), "application/json");
+                serverPort = Integer.parseInt(serverPortStr);
+            } catch (NumberFormatException ignored) {}
         }
-    }
 
-    private static void sendResponse(HttpExchange exchange, int code, String body, String contentType) throws IOException {
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        Headers headers = exchange.getResponseHeaders();
-        headers.set("Content-Type", contentType + "; charset=UTF-8");
-        headers.set("Access-Control-Allow-Origin", "*");
-        if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
-            headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            headers.set("Access-Control-Allow-Headers", "Content-Type");
-            exchange.sendResponseHeaders(204, -1);
-            return;
-        }
-        exchange.sendResponseHeaders(code, bytes.length);
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
-    }
+        InetSocketAddress address = new InetSocketAddress(serverHost, serverPort);
+        HttpServer server = HttpServer.create(address, 0);
 
-    private static Map<String, String> parseQueryParams(String query) throws UnsupportedEncodingException {
-        Map<String, String> params = new HashMap<>();
-        if (query == null) return params;
-        for (String pair : query.split("&")) {
-            int idx = pair.indexOf('=');
-            if (idx > 0) {
-                params.put(
-                        URLDecoder.decode(pair.substring(0, idx), "UTF-8"),
-                        URLDecoder.decode(pair.substring(idx + 1), "UTF-8")
-                );
-            } else if (!pair.isEmpty()) {
-                params.put(URLDecoder.decode(pair, "UTF-8"), "");
-            }
-        }
-        return params;
-    }
+        server.createContext("/points", DeviceShifuDriver::handlePoints);
+        server.createContext("/commands", DeviceShifuDriver::handleCommands);
 
-    private static int parsePositiveInt(String s, int def) {
-        try {
-            int v = Integer.parseInt(s);
-            return v > 0 ? v : def;
-        } catch (Exception e) {
-            return def;
-        }
-    }
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        server.setExecutor(executor);
 
-    private static String getEnvOrDefault(String key, String def) {
-        String val = System.getenv(key);
-        return (val == null || val.isEmpty()) ? def : val;
+        System.out.println("DeviceShifu HTTP Driver started at http://" + serverHost + ":" + serverPort);
+        server.start();
     }
 }
