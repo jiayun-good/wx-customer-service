@@ -1,249 +1,197 @@
 import com.sun.net.httpserver.HttpServer;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpExchange;
 
 import java.io.*;
 import java.net.InetSocketAddress;
-import java.net.URI;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
-public class DeviceShifuHttpDriver {
+public class DeviceShifuDriver {
 
+    // Environment variable keys
     private static final String ENV_SERVER_HOST = "SERVER_HOST";
     private static final String ENV_SERVER_PORT = "SERVER_PORT";
     private static final String ENV_DEVICE_IP = "DEVICE_IP";
-    private static final String ENV_DEVICE_MODEL = "DEVICE_MODEL";
-    private static final String ENV_DEVICE_NAME = "DEVICE_NAME";
-    private static final String ENV_DEVICE_TYPE = "DEVICE_TYPE";
-    private static final String ENV_MANUFACTURER = "MANUFACTURER";
+    private static final String ENV_DEVICE_PORT = "DEVICE_PORT";
 
-    // Mock device data for demonstration
-    private static final List<Map<String, Object>> MOCK_DATA_POINTS = new ArrayList<>();
+    // Dummy data for illustration (replace with actual device interaction logic)
+    private static final List<Map<String, Object>> DATA_POINTS = Collections.synchronizedList(new ArrayList<>());
 
     static {
-        // Populate with some example telemetry data points
-        for (int i = 1; i <= 25; i++) {
+        // Populate with some fake data for demonstration
+        for (int i = 1; i <= 50; i++) {
             Map<String, Object> point = new HashMap<>();
             point.put("id", i);
             point.put("timestamp", System.currentTimeMillis());
             point.put("value", Math.random() * 100);
-            point.put("status", "OK");
-            MOCK_DATA_POINTS.add(point);
+            DATA_POINTS.add(point);
         }
     }
 
-    public static void main(String[] args) throws Exception {
-        String host = getEnvOrDefault(ENV_SERVER_HOST, "0.0.0.0");
-        int port = Integer.parseInt(getEnvOrDefault(ENV_SERVER_PORT, "8080"));
+    public static void main(String[] args) throws IOException {
+        String host = System.getenv(ENV_SERVER_HOST);
+        String portStr = System.getenv(ENV_SERVER_PORT);
+
+        if (host == null || host.isEmpty()) host = "0.0.0.0";
+        int port = 8080;
+        if (portStr != null) {
+            try {
+                port = Integer.parseInt(portStr);
+            } catch (NumberFormatException ignored) {}
+        }
 
         HttpServer server = HttpServer.create(new InetSocketAddress(host, port), 0);
 
         server.createContext("/points", new PointsHandler());
         server.createContext("/commands", new CommandsHandler());
-        server.setExecutor(Executors.newCachedThreadPool());
-        server.start();
 
-        System.out.printf("DeviceShifu HTTP Driver started at http://%s:%d%n", host, port);
+        server.setExecutor(null);
+        server.start();
+        System.out.println("DeviceShifu Driver HTTP Server started at http://" + host + ":" + port + " ...");
     }
 
     static class PointsHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed");
+            if (!exchange.getRequestMethod().equalsIgnoreCase("GET")) {
+                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
                 return;
             }
 
-            Map<String, String> queryParams = parseQuery(exchange.getRequestURI());
-            int page = parseInt(queryParams.getOrDefault("page", "1"), 1);
-            int limit = parseInt(queryParams.getOrDefault("limit", "10"), 10);
+            // Parse query params
+            Map<String, String> queryParams = parseQueryParams(exchange.getRequestURI().getRawQuery());
+            int page = parseIntOrDefault(queryParams.get("page"), 1);
+            int limit = parseIntOrDefault(queryParams.get("limit"), 10);
 
-            int fromIndex = Math.max((page - 1) * limit, 0);
-            int toIndex = Math.min(fromIndex + limit, MOCK_DATA_POINTS.size());
+            // Pagination logic
+            int start = (page - 1) * limit;
+            int end = Math.min(start + limit, DATA_POINTS.size());
+            List<Map<String, Object>> pagedData;
+            if (start >= DATA_POINTS.size()) {
+                pagedData = Collections.emptyList();
+            } else {
+                pagedData = DATA_POINTS.subList(start, end);
+            }
 
-            List<Map<String, Object>> pageData = fromIndex >= MOCK_DATA_POINTS.size()
-                    ? Collections.emptyList()
-                    : MOCK_DATA_POINTS.subList(fromIndex, toIndex);
+            // Filter logic (optional, e.g., by value)
+            // Example: /points?min=30
+            if (queryParams.containsKey("min")) {
+                double minValue = parseDoubleOrDefault(queryParams.get("min"), Double.MIN_VALUE);
+                pagedData = pagedData.stream()
+                        .filter(dp -> ((Number) dp.get("value")).doubleValue() >= minValue)
+                        .collect(Collectors.toList());
+            }
+            if (queryParams.containsKey("max")) {
+                double maxValue = parseDoubleOrDefault(queryParams.get("max"), Double.MAX_VALUE);
+                pagedData = pagedData.stream()
+                        .filter(dp -> ((Number) dp.get("value")).doubleValue() <= maxValue)
+                        .collect(Collectors.toList());
+            }
 
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("device", getDeviceMeta());
-            result.put("page", page);
-            result.put("limit", limit);
-            result.put("total", MOCK_DATA_POINTS.size());
-            result.put("data", pageData);
-
-            String json = toJson(result);
-
-            Headers headers = exchange.getResponseHeaders();
-            headers.set("Content-Type", "application/json; charset=utf-8");
-            sendResponse(exchange, 200, json);
+            // Compose JSON response
+            String jsonResponse = serializePointsResponse(pagedData, page, limit, DATA_POINTS.size());
+            sendResponse(exchange, 200, jsonResponse, "application/json");
         }
     }
 
     static class CommandsHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed");
+            if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
                 return;
             }
 
-            String requestBody = readRequestBody(exchange.getRequestBody());
-            Map<String, Object> command;
-            try {
-                command = parseJson(requestBody);
-            } catch (Exception e) {
-                sendResponse(exchange, 400, "{\"error\":\"Invalid JSON payload.\"}");
-                return;
-            }
-            // Here, you would interact with the actual device with the command payload.
-            // For demonstration, just echo back received command.
-            Map<String, Object> response = new LinkedHashMap<>();
-            response.put("status", "success");
-            response.put("received", command);
-            response.put("timestamp", System.currentTimeMillis());
-            String json = toJson(response);
+            InputStream is = exchange.getRequestBody();
+            String body = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))
+                    .lines().collect(Collectors.joining("\n"));
+            is.close();
 
-            Headers headers = exchange.getResponseHeaders();
-            headers.set("Content-Type", "application/json; charset=utf-8");
-            sendResponse(exchange, 200, json);
+            // For demonstration: just echo back the command and fake a result
+            // In real implementation, parse and send command to device
+            String result = "{ \"status\": \"success\", \"received\": " + body + " }";
+            sendResponse(exchange, 200, result, "application/json");
         }
     }
 
-    private static Map<String, String> parseQuery(URI uri) {
-        Map<String, String> queryPairs = new LinkedHashMap<>();
-        String query = uri.getRawQuery();
-        if (query == null) return queryPairs;
+    // Utility: parse query string into map
+    private static Map<String, String> parseQueryParams(String query) {
+        Map<String, String> params = new HashMap<>();
+        if (query == null || query.isEmpty()) return params;
         String[] pairs = query.split("&");
         for (String pair : pairs) {
-            int idx = pair.indexOf("=");
-            try {
-                queryPairs.put(
-                        idx > 0 ? URLDecoder.decode(pair.substring(0, idx), "UTF-8") : pair,
-                        idx > 0 && pair.length() > idx + 1 ? URLDecoder.decode(pair.substring(idx + 1), "UTF-8") : ""
-                );
-            } catch (UnsupportedEncodingException ignored) {}
+            int idx = pair.indexOf('=');
+            if (idx > 0 && idx < pair.length() - 1) {
+                String key = decodeUrlComponent(pair.substring(0, idx));
+                String value = decodeUrlComponent(pair.substring(idx + 1));
+                params.put(key, value);
+            }
         }
-        return queryPairs;
+        return params;
     }
 
-    private static int parseInt(String val, int defaultVal) {
+    private static String decodeUrlComponent(String s) {
         try {
-            return Integer.parseInt(val);
-        } catch (Exception e) {
-            return defaultVal;
+            return java.net.URLDecoder.decode(s, StandardCharsets.UTF_8.name());
+        } catch (UnsupportedEncodingException e) {
+            return "";
         }
     }
 
-    private static void sendResponse(HttpExchange exchange, int code, String body) throws IOException {
-        byte[] responseBytes = body.getBytes(StandardCharsets.UTF_8);
-        exchange.sendResponseHeaders(code, responseBytes.length);
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(responseBytes);
+    private static int parseIntOrDefault(String value, int def) {
+        if (value == null) return def;
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException ex) {
+            return def;
         }
     }
 
-    private static String readRequestBody(InputStream is) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] buf = new byte[1024];
-        int read;
-        while ((read = is.read(buf)) != -1) {
-            baos.write(buf, 0, read);
+    private static double parseDoubleOrDefault(String value, double def) {
+        if (value == null) return def;
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException ex) {
+            return def;
         }
-        return baos.toString(StandardCharsets.UTF_8.name());
     }
 
-    private static Map<String, Object> getDeviceMeta() {
-        Map<String, Object> meta = new LinkedHashMap<>();
-        meta.put("device_name", System.getenv(ENV_DEVICE_NAME));
-        meta.put("device_model", System.getenv(ENV_DEVICE_MODEL));
-        meta.put("manufacturer", System.getenv(ENV_MANUFACTURER));
-        meta.put("device_type", System.getenv(ENV_DEVICE_TYPE));
-        meta.put("device_ip", System.getenv(ENV_DEVICE_IP));
-        return meta;
-    }
-
-    // Minimal JSON serialization for demonstration (no third-party libraries)
-    private static String toJson(Object obj) {
-        if (obj instanceof Map) {
-            StringBuilder sb = new StringBuilder();
+    // Simple JSON serialization for points
+    private static String serializePointsResponse(List<Map<String, Object>> points, int page, int limit, int total) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append("\"page\":").append(page).append(",");
+        sb.append("\"limit\":").append(limit).append(",");
+        sb.append("\"total\":").append(total).append(",");
+        sb.append("\"points\":[");
+        for (int i = 0; i < points.size(); i++) {
+            Map<String, Object> p = points.get(i);
             sb.append("{");
-            boolean first = true;
-            for (Map.Entry<?, ?> entry : ((Map<?, ?>) obj).entrySet()) {
-                if (!first) sb.append(",");
-                sb.append("\"").append(escapeJson(entry.getKey().toString())).append("\":");
-                sb.append(toJson(entry.getValue()));
-                first = false;
+            int j = 0;
+            for (Map.Entry<String, Object> entry : p.entrySet()) {
+                sb.append("\"").append(entry.getKey()).append("\":");
+                if (entry.getValue() instanceof Number) {
+                    sb.append(entry.getValue());
+                } else {
+                    sb.append("\"").append(entry.getValue().toString()).append("\"");
+                }
+                if (++j < p.size()) sb.append(",");
             }
             sb.append("}");
-            return sb.toString();
-        } else if (obj instanceof List) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("[");
-            boolean first = true;
-            for (Object item : (List<?>) obj) {
-                if (!first) sb.append(",");
-                sb.append(toJson(item));
-                first = false;
-            }
-            sb.append("]");
-            return sb.toString();
-        } else if (obj instanceof String) {
-            return "\"" + escapeJson(obj.toString()) + "\"";
-        } else if (obj instanceof Number || obj instanceof Boolean) {
-            return String.valueOf(obj);
-        } else if (obj == null) {
-            return "null";
-        } else {
-            return "\"" + escapeJson(obj.toString()) + "\"";
+            if (i < points.size() - 1) sb.append(",");
         }
+        sb.append("]}");
+        return sb.toString();
     }
 
-    private static String escapeJson(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\b", "\\b")
-                .replace("\f", "\\f").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
-    }
-
-    // Minimal JSON parser for demonstration (valid for simple flat JSON objects)
-    private static Map<String, Object> parseJson(String json) throws Exception {
-        json = json.trim();
-        if (!json.startsWith("{") || !json.endsWith("}")) throw new Exception("Invalid JSON");
-        Map<String, Object> map = new HashMap<>();
-        String body = json.substring(1, json.length() - 1);
-        String[] pairs = body.split(",");
-        for (String pair : pairs) {
-            if (pair.trim().isEmpty()) continue;
-            int idx = pair.indexOf(":");
-            if (idx == -1) continue;
-            String key = pair.substring(0, idx).trim().replaceAll("^\"|\"$", "");
-            String value = pair.substring(idx + 1).trim();
-            if (value.startsWith("\"") && value.endsWith("\"")) {
-                map.put(key, value.substring(1, value.length() - 1));
-            } else if ("null".equals(value)) {
-                map.put(key, null);
-            } else if ("true".equals(value) || "false".equals(value)) {
-                map.put(key, Boolean.valueOf(value));
-            } else {
-                try {
-                    if (value.contains(".")) {
-                        map.put(key, Double.valueOf(value));
-                    } else {
-                        map.put(key, Long.valueOf(value));
-                    }
-                } catch (Exception e) {
-                    map.put(key, value);
-                }
-            }
-        }
-        return map;
-    }
-
-    private static String getEnvOrDefault(String key, String def) {
-        String v = System.getenv(key);
-        return v == null || v.trim().isEmpty() ? def : v;
+    private static void sendResponse(HttpExchange exchange, int status, String content, String contentType) throws IOException {
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.sendResponseHeaders(status, bytes.length);
+        OutputStream os = exchange.getResponseBody();
+        os.write(bytes);
+        os.close();
     }
 }
