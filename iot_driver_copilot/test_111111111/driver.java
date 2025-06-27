@@ -1,91 +1,88 @@
-import com.sun.net.httpserver.Headers;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpHandler;
 
 import java.io.*;
 import java.net.InetSocketAddress;
-import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 public class DeviceShifuDriver {
-    // Environment variables
-    private static final String ENV_HOST = "SERVER_HOST";
-    private static final String ENV_PORT = "SERVER_PORT";
-    private static final String ENV_DEVICE_IP = "DEVICE_IP";
-    private static final String ENV_DEVICE_PORT = "DEVICE_PORT";
 
-    // Simulated telemetry data for demonstration
-    private static final List<Map<String, Object>> telemetryData = new ArrayList<>();
+    // Simulated device data points (in-memory for demonstration)
+    private static final List<Map<String, Object>> DATA_POINTS = Collections.synchronizedList(new ArrayList<>());
+    private static final int DEFAULT_PAGE_SIZE = 10;
 
-    static {
-        // Populate with dummy data points
-        for (int i = 1; i <= 100; i++) {
-            Map<String, Object> point = new LinkedHashMap<>();
-            point.put("id", i);
-            point.put("temperature", 20 + i % 10);
-            point.put("humidity", 50 + i % 5);
-            point.put("timestamp", System.currentTimeMillis() - i * 1000L);
-            telemetryData.add(point);
-        }
-    }
+    // Device configuration loaded from environment
+    private static final String DEVICE_IP = System.getenv("DEVICE_IP");
+    private static final String DEVICE_PORT = System.getenv("DEVICE_PORT");
+    private static final String SERVER_HOST = System.getenv("SERVER_HOST") != null ? System.getenv("SERVER_HOST") : "0.0.0.0";
+    private static final int SERVER_PORT = System.getenv("SERVER_PORT") != null ? Integer.parseInt(System.getenv("SERVER_PORT")) : 8080;
 
-    public static void main(String[] args) throws IOException {
-        String host = System.getenv(ENV_HOST);
-        String portStr = System.getenv(ENV_PORT);
+    public static void main(String[] args) throws Exception {
+        initSampleData();
 
-        if (host == null || portStr == null) {
-            System.err.println("Required environment variables: SERVER_HOST, SERVER_PORT");
-            System.exit(1);
-        }
-
-        int port;
-        try {
-            port = Integer.parseInt(portStr);
-        } catch (NumberFormatException e) {
-            System.err.println("SERVER_PORT must be a valid number.");
-            System.exit(1);
-            return;
-        }
-
-        HttpServer server = HttpServer.create(new InetSocketAddress(host, port), 0);
+        HttpServer server = HttpServer.create(new InetSocketAddress(SERVER_HOST, SERVER_PORT), 0);
         server.createContext("/points", new PointsHandler());
         server.createContext("/commands", new CommandsHandler());
-        server.setExecutor(null);
+
+        server.setExecutor(Executors.newCachedThreadPool());
+        System.out.println("DeviceShifuDriver HTTP Server started on " + SERVER_HOST + ":" + SERVER_PORT);
         server.start();
-        System.out.println("DeviceShifu HTTP driver running at http://" + host + ":" + port);
+    }
+
+    // Populate with sample telemetry data
+    private static void initSampleData() {
+        for (int i = 1; i <= 50; i++) {
+            Map<String, Object> point = new HashMap<>();
+            point.put("id", i);
+            point.put("timestamp", System.currentTimeMillis() - i * 10000L);
+            point.put("temperature", 20.0 + Math.random() * 5);
+            point.put("humidity", 30.0 + Math.random() * 10);
+            DATA_POINTS.add(point);
+        }
     }
 
     // Handler for GET /points
     static class PointsHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
+            if (!exchange.getRequestMethod().equalsIgnoreCase("GET")) {
+                sendJsonResponse(exchange, 405, "{\"error\":\"Method Not Allowed\"}");
                 return;
             }
+            Map<String, String> params = queryToMap(exchange.getRequestURI().getRawQuery());
 
-            Map<String, String> queryParams = parseQueryParams(exchange.getRequestURI().getRawQuery());
-            int page = parseIntOrDefault(queryParams.get("page"), 1);
-            int limit = parseIntOrDefault(queryParams.get("limit"), 10);
+            int page = 1;
+            int limit = DEFAULT_PAGE_SIZE;
+            try {
+                if (params.containsKey("page")) {
+                    page = Integer.parseInt(params.get("page"));
+                    if (page < 1) page = 1;
+                }
+                if (params.containsKey("limit")) {
+                    limit = Integer.parseInt(params.get("limit"));
+                    if (limit < 1) limit = DEFAULT_PAGE_SIZE;
+                }
+            } catch (NumberFormatException ignored) {}
 
             int fromIndex = (page - 1) * limit;
-            int toIndex = Math.min(fromIndex + limit, telemetryData.size());
+            int toIndex = Math.min(fromIndex + limit, DATA_POINTS.size());
+            List<Map<String, Object>> pageData = new ArrayList<>();
+            if (fromIndex < DATA_POINTS.size())
+                pageData = DATA_POINTS.subList(fromIndex, toIndex);
 
-            List<Map<String, Object>> result = new ArrayList<>();
-            if (fromIndex < telemetryData.size()) {
-                result = telemetryData.subList(fromIndex, toIndex);
-            }
+            Map<String, Object> result = new HashMap<>();
+            result.put("page", page);
+            result.put("limit", limit);
+            result.put("total", DATA_POINTS.size());
+            result.put("data", pageData);
 
-            Map<String, Object> response = new LinkedHashMap<>();
-            response.put("page", page);
-            response.put("limit", limit);
-            response.put("total", telemetryData.size());
-            response.put("data", result);
-
-            String json = toJson(response);
-            sendResponse(exchange, 200, json, "application/json");
+            sendJsonResponse(exchange, 200, toJson(result));
         }
     }
 
@@ -93,122 +90,93 @@ public class DeviceShifuDriver {
     static class CommandsHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
+            if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+                sendJsonResponse(exchange, 405, "{\"error\":\"Method Not Allowed\"}");
+                return;
+            }
+            String contentType = Optional.ofNullable(exchange.getRequestHeaders().getFirst("Content-Type")).orElse("");
+            if (!contentType.toLowerCase().contains("application/json")) {
+                sendJsonResponse(exchange, 415, "{\"error\":\"Content-Type must be application/json\"}");
                 return;
             }
 
-            String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
-            if (contentType == null || !contentType.toLowerCase().contains("application/json")) {
-                sendResponse(exchange, 400, "{\"error\": \"Content-Type must be application/json\"}", "application/json");
-                return;
-            }
-
-            String body = readRequestBody(exchange);
-            if (body == null || body.trim().isEmpty()) {
-                sendResponse(exchange, 400, "{\"error\": \"Empty request body\"}", "application/json");
-                return;
-            }
-
-            // Simulate device command execution and response
-            Map<String, Object> response = new LinkedHashMap<>();
+            String body = new BufferedReader(new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8))
+                    .lines().collect(Collectors.joining("\n"));
+            // In a real driver, parse the command & interact with device.
+            // Here, just echo the command and respond with status.
+            Map<String, Object> response = new HashMap<>();
+            response.put("received_command", body);
             response.put("status", "success");
-            response.put("message", "Command executed");
-            response.put("received", body);
-
-            sendResponse(exchange, 200, toJson(response), "application/json");
+            sendJsonResponse(exchange, 200, toJson(response));
         }
     }
 
-    // Utility: Parse query parameters
-    private static Map<String, String> parseQueryParams(String rawQuery) throws UnsupportedEncodingException {
-        Map<String, String> queryParams = new HashMap<>();
-        if (rawQuery == null || rawQuery.isEmpty()) {
-            return queryParams;
-        }
-        String[] pairs = rawQuery.split("&");
-        for (String pair : pairs) {
-            int idx = pair.indexOf("=");
-            if (idx > -1) {
-                queryParams.put(
-                        URLDecoder.decode(pair.substring(0, idx), StandardCharsets.UTF_8.name()),
-                        URLDecoder.decode(pair.substring(idx + 1), StandardCharsets.UTF_8.name())
-                );
-            } else {
-                queryParams.put(
-                        URLDecoder.decode(pair, StandardCharsets.UTF_8.name()),
-                        ""
-                );
+    // --- Utility methods ---
+
+    private static Map<String, String> queryToMap(String query) {
+        Map<String, String> result = new HashMap<>();
+        if (query == null || query.trim().isEmpty()) return result;
+        for (String param : query.split("&")) {
+            String[] entry = param.split("=", 2);
+            if (entry.length > 0) {
+                String key = urlDecode(entry[0]);
+                String value = entry.length > 1 ? urlDecode(entry[1]) : "";
+                result.put(key, value);
             }
         }
-        return queryParams;
+        return result;
     }
 
-    // Utility: Parse int with default
-    private static int parseIntOrDefault(String val, int def) {
+    private static String urlDecode(String s) {
         try {
-            return Integer.parseInt(val);
+            return java.net.URLDecoder.decode(s, StandardCharsets.UTF_8.name());
         } catch (Exception e) {
-            return def;
+            return s;
         }
     }
 
-    // Utility: Read request body
-    private static String readRequestBody(HttpExchange exchange) throws IOException {
-        InputStream is = exchange.getRequestBody();
-        ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        byte[] data = new byte[4096];
-        int bytesRead;
-        while ((bytesRead = is.read(data)) != -1) {
-            buf.write(data, 0, bytesRead);
-        }
-        return buf.toString(StandardCharsets.UTF_8.name());
-    }
-
-    // Utility: Send HTTP response
-    private static void sendResponse(HttpExchange exchange, int statusCode, String response, String contentType) throws IOException {
+    private static void sendJsonResponse(HttpExchange exchange, int status, String json) throws IOException {
         Headers headers = exchange.getResponseHeaders();
-        headers.set("Content-Type", contentType + "; charset=utf-8");
-        byte[] respBytes = response.getBytes(StandardCharsets.UTF_8);
-        exchange.sendResponseHeaders(statusCode, respBytes.length);
+        headers.set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(status, json.getBytes(StandardCharsets.UTF_8).length);
         try (OutputStream os = exchange.getResponseBody()) {
-            os.write(respBytes);
+            os.write(json.getBytes(StandardCharsets.UTF_8));
         }
     }
 
-    // Utility: Very simple JSON serialization (for demonstration; a real implementation should use a JSON library)
+    // Simple JSON serializer for maps and lists
     private static String toJson(Object obj) {
         if (obj instanceof Map) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
+            StringBuilder sb = new StringBuilder("{");
             boolean first = true;
             for (Map.Entry<?, ?> entry : ((Map<?, ?>) obj).entrySet()) {
                 if (!first) sb.append(",");
-                sb.append("\"").append(escape(entry.getKey().toString())).append("\":");
+                sb.append("\"").append(escapeJson(entry.getKey().toString())).append("\":");
                 sb.append(toJson(entry.getValue()));
                 first = false;
             }
             sb.append("}");
             return sb.toString();
         } else if (obj instanceof List) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("[");
+            StringBuilder sb = new StringBuilder("[");
             boolean first = true;
-            for (Object item : (List<?>) obj) {
+            for (Object o : (List<?>) obj) {
                 if (!first) sb.append(",");
-                sb.append(toJson(item));
+                sb.append(toJson(o));
                 first = false;
             }
             sb.append("]");
             return sb.toString();
         } else if (obj instanceof String) {
-            return "\"" + escape((String) obj) + "\"";
+            return "\"" + escapeJson((String) obj) + "\"";
+        } else if (obj == null) {
+            return "null";
         } else {
-            return String.valueOf(obj);
+            return obj.toString();
         }
     }
 
-    private static String escape(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    private static String escapeJson(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
     }
 }
