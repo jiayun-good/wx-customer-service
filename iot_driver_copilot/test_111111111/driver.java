@@ -1,65 +1,59 @@
+package shifu.driver;
+
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
 import java.io.*;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.Executors;
+import org.w3c.dom.*;
+import org.xml.sax.InputSource;
 
 public class DeviceShifuDriver {
 
-    // Environment variable keys
-    private static final String ENV_SERVER_HOST = "SERVER_HOST";
-    private static final String ENV_SERVER_PORT = "SERVER_PORT";
-    private static final String ENV_DEVICE_IP = "DEVICE_IP";
-    private static final String ENV_DEVICE_PORT = "DEVICE_PORT";
+    private static final String DEFAULT_SERVER_HOST = "0.0.0.0";
+    private static final int DEFAULT_SERVER_PORT = 8080;
 
-    // Simulated data point store
-    private static final List<Map<String, Object>> DATA_POINTS = Collections.synchronizedList(new LinkedList<>());
-    private static final int DEFAULT_PAGE_SIZE = 10;
+    private static final String DEVICE_NAME = getEnv("DEVICE_NAME", "test111111111");
+    private static final String DEVICE_MODEL = getEnv("DEVICE_MODEL", "test111111111");
+    private static final String MANUFACTURER = getEnv("MANUFACTURER", "s'da");
+    private static final String DEVICE_TYPE = getEnv("DEVICE_TYPE", "sda");
 
-    public static void main(String[] args) throws IOException {
-        // Read configuration from environment variables
-        String serverHost = System.getenv(ENV_SERVER_HOST);
-        String serverPortStr = System.getenv(ENV_SERVER_PORT);
-        String deviceIp = System.getenv(ENV_DEVICE_IP);
-        String devicePortStr = System.getenv(ENV_DEVICE_PORT);
+    private static final String SERVER_HOST = getEnv("SERVER_HOST", DEFAULT_SERVER_HOST);
+    private static final int SERVER_PORT = getEnvInt("SERVER_PORT", DEFAULT_SERVER_PORT);
 
-        if (serverHost == null || serverHost.isEmpty()) serverHost = "0.0.0.0";
-        int serverPort = 8080;
-        try {
-            if (serverPortStr != null && !serverPortStr.isEmpty()) {
-                serverPort = Integer.parseInt(serverPortStr);
-            }
-        } catch (NumberFormatException ignored) {
-        }
+    // Simulated in-memory device datapoints
+    private static final List<Map<String, Object>> deviceData = Collections.synchronizedList(new ArrayList<>());
 
-        // Dummy device data population for demonstration
-        populateDummyData();
-
-        // Set up HTTP server
-        InetSocketAddress address = new InetSocketAddress(serverHost, serverPort);
-        HttpServer server = HttpServer.create(address, 0);
+    public static void main(String[] args) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress(SERVER_HOST, SERVER_PORT), 0);
         server.createContext("/points", new PointsHandler());
         server.createContext("/commands", new CommandsHandler());
-        server.setExecutor(Executors.newCachedThreadPool());
+        server.setExecutor(null); // default executor
+        System.out.println("DeviceShifuDriver HTTP server started at http://" + SERVER_HOST + ":" + SERVER_PORT);
         server.start();
-
-        System.out.printf("DeviceShifu HTTP driver started on %s:%d%n", serverHost, serverPort);
     }
 
-    // Populate with dummy device data (simulate real device fetch)
-    private static void populateDummyData() {
-        for (int i = 1; i <= 100; i++) {
-            Map<String, Object> point = new HashMap<>();
-            point.put("id", i);
-            point.put("timestamp", System.currentTimeMillis() - (100 - i) * 1000L);
-            point.put("value", Math.random() * 100);
-            point.put("status", "OK");
-            DATA_POINTS.add(point);
+    // Util: Get environment variable with fallback
+    private static String getEnv(String key, String defaultVal) {
+        String v = System.getenv(key);
+        return v == null || v.isEmpty() ? defaultVal : v;
+    }
+
+    private static int getEnvInt(String key, int defaultVal) {
+        try {
+            String v = System.getenv(key);
+            if (v == null || v.isEmpty()) return defaultVal;
+            return Integer.parseInt(v);
+        } catch (Exception e) {
+            return defaultVal;
         }
     }
 
@@ -68,47 +62,43 @@ public class DeviceShifuDriver {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed");
+                respond(exchange, 405, "Method Not Allowed", "text/plain");
                 return;
             }
-            // Parse query params for pagination
-            Map<String, String> params = queryToMap(exchange.getRequestURI().getRawQuery());
-            int page = parseIntWithDefault(params.get("page"), 1);
-            int limit = parseIntWithDefault(params.get("limit"), DEFAULT_PAGE_SIZE);
 
-            // Filter and paginate
-            int total = DATA_POINTS.size();
-            int fromIdx = Math.max(0, (page - 1) * limit);
-            int toIdx = Math.min(fromIdx + limit, total);
+            Map<String, String> queryParams = parseQuery(exchange.getRequestURI().getRawQuery());
+            int page = 1, limit = 10;
+            try {
+                if (queryParams.containsKey("page")) {
+                    page = Integer.parseInt(queryParams.get("page"));
+                    if (page < 1) page = 1;
+                }
+                if (queryParams.containsKey("limit")) {
+                    limit = Integer.parseInt(queryParams.get("limit"));
+                    if (limit < 1) limit = 10;
+                }
+            } catch (Exception ignore) {}
 
-            List<Map<String, Object>> subList = new ArrayList<>();
-            if (fromIdx < toIdx) {
-                subList.addAll(DATA_POINTS.subList(fromIdx, toIdx));
+            List<Map<String, Object>> data;
+            synchronized (deviceData) {
+                data = new ArrayList<>(deviceData);
             }
+            int from = Math.min((page - 1) * limit, data.size());
+            int to = Math.min(from + limit, data.size());
+            List<Map<String, Object>> pageData = data.subList(from, to);
 
-            // Build JSON response
-            String responseJson = buildPointsResponse(subList, page, limit, total);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("device_name", DEVICE_NAME);
+            result.put("device_model", DEVICE_MODEL);
+            result.put("manufacturer", MANUFACTURER);
+            result.put("device_type", DEVICE_TYPE);
+            result.put("page", page);
+            result.put("limit", limit);
+            result.put("total", data.size());
+            result.put("data_points", pageData);
 
-            Headers headers = exchange.getResponseHeaders();
-            headers.set("Content-Type", "application/json; charset=utf-8");
-            sendResponse(exchange, 200, responseJson);
-        }
-
-        private String buildPointsResponse(List<Map<String, Object>> points, int page, int limit, int total) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
-            sb.append("\"page\":").append(page).append(",");
-            sb.append("\"limit\":").append(limit).append(",");
-            sb.append("\"total\":").append(total).append(",");
-            sb.append("\"data\":[");
-            boolean first = true;
-            for (Map<String, Object> point : points) {
-                if (!first) sb.append(",");
-                sb.append(mapToJson(point));
-                first = false;
-            }
-            sb.append("]}");
-            return sb.toString();
+            String resp = toJson(result);
+            respond(exchange, 200, resp, "application/json");
         }
     }
 
@@ -117,97 +107,228 @@ public class DeviceShifuDriver {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                sendResponse(exchange, 405, "Method Not Allowed");
+                respond(exchange, 405, "Method Not Allowed", "text/plain");
                 return;
             }
-            Headers headers = exchange.getResponseHeaders();
-            headers.set("Content-Type", "application/json; charset=utf-8");
+            String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+            String body = readAll(exchange.getRequestBody());
 
-            String requestBody = readRequestBody(exchange);
-            if (requestBody == null || requestBody.isEmpty()) {
-                sendResponse(exchange, 400, "{\"error\":\"Empty request body\"}");
+            if (contentType != null && contentType.contains("application/json")) {
+                Map<String, Object> cmd = parseJson(body);
+                if (cmd == null) {
+                    respond(exchange, 400, "{\"error\":\"Invalid JSON\"}", "application/json");
+                    return;
+                }
+                Map<String, Object> result = executeDeviceCommand(cmd);
+                respond(exchange, 200, toJson(result), "application/json");
                 return;
-            }
-
-            // Simulate command handling; echo back received command
-            String responseJson = "{\"result\":\"Command received\",\"command\":" + escapeJson(requestBody) + "}";
-            sendResponse(exchange, 200, responseJson);
-        }
-    }
-
-    // Utility Functions
-
-    private static String mapToJson(Map<String, Object> map) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{");
-        boolean first = true;
-        for (Map.Entry<String, Object> entry : map.entrySet()) {
-            if (!first) sb.append(",");
-            sb.append("\"").append(escapeJson(entry.getKey())).append("\":");
-            Object v = entry.getValue();
-            if (v instanceof Number || v instanceof Boolean) {
-                sb.append(v.toString());
+            } else if (contentType != null && contentType.contains("application/xml")) {
+                Map<String, Object> cmd = parseXml(body);
+                if (cmd == null) {
+                    respond(exchange, 400, "{\"error\":\"Invalid XML\"}", "application/json");
+                    return;
+                }
+                Map<String, Object> result = executeDeviceCommand(cmd);
+                respond(exchange, 200, toJson(result), "application/json");
+                return;
+            } else if (contentType != null && contentType.contains("text/csv")) {
+                Map<String, Object> cmd = parseCsv(body);
+                Map<String, Object> result = executeDeviceCommand(cmd);
+                respond(exchange, 200, toJson(result), "application/json");
+                return;
+            } else if (contentType != null && contentType.contains("text/plain")) {
+                Map<String, Object> cmd = new HashMap<>();
+                cmd.put("plain_text", body);
+                Map<String, Object> result = executeDeviceCommand(cmd);
+                respond(exchange, 200, toJson(result), "application/json");
+                return;
+            } else if (contentType != null && contentType.contains("application/octet-stream")) {
+                Map<String, Object> cmd = new HashMap<>();
+                cmd.put("binary", Base64.getEncoder().encodeToString(body.getBytes(StandardCharsets.UTF_8)));
+                Map<String, Object> result = executeDeviceCommand(cmd);
+                respond(exchange, 200, toJson(result), "application/json");
+                return;
             } else {
-                sb.append("\"").append(escapeJson(String.valueOf(v))).append("\"");
+                respond(exchange, 415, "{\"error\":\"Unsupported Content-Type\"}", "application/json");
             }
-            first = false;
         }
-        sb.append("}");
-        return sb.toString();
     }
 
-    private static int parseIntWithDefault(String s, int defaultValue) {
-        try {
-            if (s != null) return Integer.parseInt(s);
-        } catch (NumberFormatException ignored) {
+    // Simulate command execution and update device data
+    private static Map<String, Object> executeDeviceCommand(Map<String, Object> cmd) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("command_received", cmd);
+        result.put("timestamp", System.currentTimeMillis());
+        // For demo, simply append to deviceData as a new "telemetry" sample
+        Map<String, Object> telemetry = new LinkedHashMap<>();
+        telemetry.put("sample_id", UUID.randomUUID().toString());
+        telemetry.put("timestamp", System.currentTimeMillis());
+        telemetry.putAll(cmd);
+        synchronized (deviceData) {
+            deviceData.add(0, telemetry);
+            if (deviceData.size() > 1000) { // keep up to 1000
+                deviceData.remove(deviceData.size() - 1);
+            }
         }
-        return defaultValue;
+        result.put("result", "success");
+        return result;
     }
 
-    private static Map<String, String> queryToMap(String query) {
-        Map<String, String> res = new HashMap<>();
-        if (query == null || query.isEmpty()) return res;
-        String[] pairs = query.split("&");
-        for (String pair : pairs) {
+    // Util: Parse query string
+    private static Map<String, String> parseQuery(String query) {
+        Map<String, String> map = new HashMap<>();
+        if (query == null || query.isEmpty()) return map;
+        for (String pair : query.split("&")) {
             int idx = pair.indexOf('=');
-            if (idx == -1) continue;
-            res.put(urlDecode(pair.substring(0, idx)), urlDecode(pair.substring(idx + 1)));
+            if (idx > 0) {
+                map.put(urlDecode(pair.substring(0, idx)), urlDecode(pair.substring(idx + 1)));
+            } else {
+                map.put(urlDecode(pair), "");
+            }
         }
-        return res;
+        return map;
     }
 
     private static String urlDecode(String s) {
         try {
-            return java.net.URLDecoder.decode(s, "UTF-8");
+            return URLDecoder.decode(s, StandardCharsets.UTF_8.name());
         } catch (Exception e) {
             return s;
         }
     }
 
-    private static String readRequestBody(HttpExchange exchange) throws IOException {
-        InputStream in = exchange.getRequestBody();
-        StringBuilder sb = new StringBuilder();
-        byte[] buffer = new byte[1024];
-        int read;
-        while ((read = in.read(buffer)) != -1) {
-            sb.append(new String(buffer, 0, read, StandardCharsets.UTF_8));
+    // Util: Read all InputStream
+    private static String readAll(InputStream stream) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        int len;
+        while ((len = stream.read(buf)) != -1) {
+            out.write(buf, 0, len);
         }
-        return sb.toString().trim();
+        return out.toString(StandardCharsets.UTF_8.name());
     }
 
-    private static void sendResponse(HttpExchange exchange, int code, String body) throws IOException {
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        exchange.sendResponseHeaders(code, bytes.length);
-        OutputStream os = exchange.getResponseBody();
-        os.write(bytes);
-        os.close();
+    // Util: Respond HTTP
+    private static void respond(HttpExchange exchange, int status, String body, String contentType) throws IOException {
+        Headers h = exchange.getResponseHeaders();
+        h.set("Content-Type", contentType + "; charset=utf-8");
+        exchange.sendResponseHeaders(status, body.getBytes(StandardCharsets.UTF_8).length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
     }
 
-    private static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
+    // Util: Simple JSON serialization (no third-party libs)
+    private static String toJson(Object obj) {
+        if (obj == null) return "null";
+        if (obj instanceof Map) {
+            Map<?, ?> map = (Map<?, ?>) obj;
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            boolean first = true;
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (!first) sb.append(",");
+                sb.append(toJson(entry.getKey().toString()));
+                sb.append(":");
+                sb.append(toJson(entry.getValue()));
+                first = false;
+            }
+            sb.append("}");
+            return sb.toString();
+        } else if (obj instanceof List) {
+            List<?> list = (List<?>) obj;
+            StringBuilder sb = new StringBuilder();
+            sb.append("[");
+            boolean first = true;
+            for (Object o : list) {
+                if (!first) sb.append(",");
+                sb.append(toJson(o));
+                first = false;
+            }
+            sb.append("]");
+            return sb.toString();
+        } else if (obj instanceof String) {
+            return "\"" + obj.toString().replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        } else if (obj instanceof Number || obj instanceof Boolean) {
+            return obj.toString();
+        } else {
+            return "\"" + String.valueOf(obj) + "\"";
+        }
+    }
+
+    // Util: Minimal JSON parsing for flat objects
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> parseJson(String json) {
+        try {
+            json = json.trim();
+            if (json.startsWith("{") && json.endsWith("}")) {
+                Map<String, Object> res = new LinkedHashMap<>();
+                String main = json.substring(1, json.length() - 1).trim();
+                // Only flat key:value pairs, no nesting
+                String[] pairs = main.split(",(?=([^\"]*\"[^\"]*\")*[^\"]*$)");
+                for (String pair : pairs) {
+                    if (pair.trim().isEmpty()) continue;
+                    String[] kv = pair.split(":", 2);
+                    String key = kv[0].trim().replaceAll("^\"|\"$", "");
+                    String value = kv.length > 1 ? kv[1].trim() : "";
+                    if (value.startsWith("\"") && value.endsWith("\"")) {
+                        value = value.substring(1, value.length() - 1);
+                        value = value.replace("\\\"", "\"").replace("\\\\", "\\");
+                        res.put(key, value);
+                    } else if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
+                        res.put(key, Boolean.parseBoolean(value));
+                    } else {
+                        try {
+                            if (value.contains(".")) {
+                                res.put(key, Double.parseDouble(value));
+                            } else {
+                                res.put(key, Long.parseLong(value));
+                            }
+                        } catch (Exception e) {
+                            res.put(key, value);
+                        }
+                    }
+                }
+                return res;
+            }
+        } catch (Exception ignore) {}
+        return null;
+    }
+
+    // Util: Minimal XML parsing for flat objects
+    private static Map<String, Object> parseXml(String xml) {
+        try {
+            DocumentBuilderFactory dbFactory = DocumentBuilderFactory.newInstance();
+            DocumentBuilder dBuilder = dbFactory.newDocumentBuilder();
+            StringReader reader = new StringReader(xml);
+            InputSource inputSource = new InputSource(reader);
+            Document doc = dBuilder.parse(inputSource);
+            doc.getDocumentElement().normalize();
+            Element root = doc.getDocumentElement();
+            Map<String, Object> map = new LinkedHashMap<>();
+            NodeList children = root.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node n = children.item(i);
+                if (n.getNodeType() == Node.ELEMENT_NODE) {
+                    map.put(n.getNodeName(), n.getTextContent());
+                }
+            }
+            return map;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // Util: Minimal CSV parsing (first row: keys, second row: values)
+    private static Map<String, Object> parseCsv(String csv) {
+        String[] lines = csv.trim().split("\n");
+        if (lines.length < 2) return new HashMap<>();
+        String[] keys = lines[0].trim().split(",");
+        String[] values = lines[1].trim().split(",");
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i < keys.length && i < values.length; i++) {
+            map.put(keys[i].trim(), values[i].trim());
+        }
+        return map;
     }
 }
